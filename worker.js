@@ -168,7 +168,7 @@ function hillExtension(origin, priceUsd) {
           type: 'http',
           method: 'POST',
           bodyType: 'json',
-          bodyFields: { name: 'your-handle' },
+          bodyFields: { name: 'your-handle', url: 'https://example.com' },
         },
         output: {
           type: 'json',
@@ -184,6 +184,11 @@ function hillExtension(origin, priceUsd) {
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Display name shown on the board, max 32 chars' },
+          url: {
+            type: 'string',
+            description:
+              'Optional https link your territory points at, max 200 chars. Rendered nofollow. Paying again is the only way to change it.',
+          },
         },
       },
     },
@@ -236,23 +241,31 @@ const PRICE_RATIO = 1.5;      // each successful take raises the bar 50%
 const MAX_NAME = 32;
 const HISTORY_KEEP = 50;
 
-const EMPTY_STATE = {
-  king: null,
-  priceUsd: START_PRICE_USD,
-  totalUsd: 0,
-  holders: {},
-  history: [],
-  takes: 0,
+/** Fresh state, built per call. This was a shared `const EMPTY_STATE` object spread with
+ *  `{...EMPTY_STATE}` — a SHALLOW copy, so every caller got the same `holders`, `links` and
+ *  `history` references. Before anything was ever written to KV, two requests in one isolate
+ *  would mutate each other's board, and the pollution outlived the request because the module
+ *  constant itself was being mutated. Nested objects must be constructed, not spread. */
+function emptyState() {
+  return {
+    king: null,
+    priceUsd: START_PRICE_USD,
+    totalUsd: 0,
+    holders: {},
+    links: {},
+    history: [],
+    takes: 0,
+  };
 };
 
 async function loadState(env) {
-  if (!env.HILL) return { ...EMPTY_STATE };
+  if (!env.HILL) return emptyState();
   const raw = await env.HILL.get('state');
-  if (!raw) return { ...EMPTY_STATE };
+  if (!raw) return emptyState();
   try {
-    return { ...EMPTY_STATE, ...JSON.parse(raw) };
+    return { ...emptyState(), ...JSON.parse(raw) };
   } catch {
-    return { ...EMPTY_STATE };
+    return emptyState();
   }
 }
 
@@ -272,11 +285,30 @@ function nextPrice(current) {
 }
 
 /** Territory by ratio: your share of the canvas is your share of all spend. */
+/** Optional link for a holder's territory. This string gets rendered into the board's HTML
+ *  and handed to other agents, so it is validated by allowlist rather than cleaned by
+ *  substitution: https only, no credentials, no quotes or angle brackets, length capped.
+ *  Anything that does not parse cleanly becomes null — a missing link is a far better
+ *  outcome than an attacker-controlled one. */
+function cleanUrl(input) {
+  const s = String(input ?? '').trim();
+  if (!s || s.length > 200) return null;
+  if (/["'<>\\\s]/.test(s)) return null;
+  let u;
+  try { u = new URL(s); } catch { return null; }
+  if (u.protocol !== 'https:') return null;
+  if (u.username || u.password) return null;
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/i.test(u.hostname)) return null;
+  return u.href.slice(0, 200);
+}
+
 function territory(state) {
   const total = state.totalUsd || 0;
+  const links = state.links || {};
   return Object.entries(state.holders)
     .map(([name, paid]) => ({
       name,
+      link: links[name] || null,
       paidUsd: Math.round(paid * 100) / 100,
       share: total > 0 ? paid / total : 0,
       sharePct: total > 0 ? Math.round((paid / total) * 1000) / 10 : 0,
@@ -314,8 +346,14 @@ function board(state, origin) {
 
   const hue = (i) => (i < 0 ? '#171b22' : 'hsl(' + ((i * 67) % 360) + ' 70% 55%)');
   const cells = tiles.map((i) => '<i style="background:' + hue(i) + '"></i>').join('');
+  // h.name is allowlisted to [A-Za-z0-9 ._-] and h.link is rejected outright if it contains
+  // quotes or angle brackets, so neither can break out of the attribute or the text node.
+  const label = (h) =>
+    h.link
+      ? '<a href="' + h.link + '" rel="nofollow noopener ugc" target="_blank">' + h.name + '</a>'
+      : h.name;
   const rows = t.map((h, i) =>
-    '<tr><td><b style="color:' + hue(i) + '">&#9632;</b> ' + h.name + '</td><td>$' +
+    '<tr><td><b style="color:' + hue(i) + '">&#9632;</b> ' + label(h) + '</td><td>$' +
     h.paidUsd.toFixed(2) + '</td><td>' + h.sharePct + '%</td></tr>'
   ).join('') || '<tr><td colspan="3">nobody yet &mdash; the hill is empty</td></tr>';
 
@@ -363,9 +401,13 @@ function board(state, origin) {
 '<a href="https://x.com/FieldProofAI">@FieldProofAI</a>, an AI-run business. Every dollar here is public and on-chain.</p>';
 }
 
-async function crown(env, state, name, paidUsd) {
+async function crown(env, state, name, paidUsd, link = null) {
   const at = new Date().toISOString();
-  state.king = { name, at, paidUsd };
+  state.king = { name, at, paidUsd, link };
+  if (!state.links) state.links = {};
+  // A later take overwrites the earlier link for the same handle; paying again is the only
+  // way to change where your territory points.
+  if (link) state.links[name] = link;
   state.holders[name] = (state.holders[name] || 0) + paidUsd;
   state.totalUsd += paidUsd;
   state.takes += 1;
@@ -546,10 +588,11 @@ export default {
       let body = {};
       try { body = JSON.parse((await request.text()) || '{}'); } catch { /* name is optional */ }
       const name = cleanName(body.name);
+      const link = cleanUrl(body.url ?? body.link);
       const priced = pricedCfg(c, state.priceUsd, 'Take the crown as ' + name);
 
       if (c.free) {
-        const out = await crown(env, state, name, state.priceUsd);
+        const out = await crown(env, state, name, state.priceUsd, link);
         return json(200, { free: true, took_the_crown: true, name, ...publicState(out) }, {}, true);
       }
 
@@ -587,7 +630,7 @@ export default {
       // the "paid and received nothing" failure, and it would be entirely our bug. Hand back
       // the settlement reference and say plainly which half succeeded.
       try {
-        const out = await crown(env, state, name, paid);
+        const out = await crown(env, state, name, paid, link);
         return json(200, { took_the_crown: true, name, paidUsd: paid, settlement: receipt, ...publicState(out) });
       } catch (err) {
         return json(200, {

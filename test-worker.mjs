@@ -103,5 +103,43 @@ ok('response admits the board did not record it', recovered?.recorded === false)
 ok('response does NOT claim the crown', recovered?.took_the_crown === false);
 ok('response hands back a settlement reference', !!recovered?.settlement, `-> ${recovered?.settlement}`);
 
+// 7. Territory links are rendered into the board's HTML and handed to other agents, so the
+//    sanitiser is a security boundary. Drive it through the real free-mode claim path and
+//    then read the rendered board back.
+const linkCases = [
+  ['https://example.com/a', true, 'plain https'],
+  ['http://example.com', false, 'plaintext http'],
+  ['javascript:alert(1)', false, 'javascript scheme'],
+  ['data:text/html,<script>alert(1)</script>', false, 'data URI'],
+  ['https://user:pw@example.com', false, 'embedded credentials'],
+  ['https://example.com/"><script>alert(1)</script>', false, 'attribute break-out'],
+  ['https://example.com/' + 'x'.repeat(400), false, 'over length cap'],
+  ['https://localhost', false, 'no public TLD'],
+];
+globalThis.fetch = async () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+for (const [candidate, shouldStick, why] of linkCases) {
+  const s = new Map();
+  const freeEnv = {
+    FREE_MODE: 'true',
+    HILL: { get: async (k) => (s.has(k) ? s.get(k) : null), put: async (k, v) => void s.set(k, v) },
+  };
+  const rc = await mod.fetch(new Request(B + '/claim', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'linktest', url: candidate }),
+  }), freeEnv, ctx);
+  const st = await rc.json();
+  const stored = st.territory?.[0]?.link ?? null;
+  ok(`link ${shouldStick ? 'accepted' : 'rejected'}: ${why}`, shouldStick ? stored !== null : stored === null, `-> ${stored}`);
+
+  const html = await (await mod.fetch(new Request(B + '/', { headers: { accept: 'text/html' } }), freeEnv, ctx)).text();
+  const hrefs = [...html.matchAll(/href="([^"]*)"/g)].map((m) => m[1]);
+  ok(`  board HTML stays clean: ${why}`,
+     !/<script/i.test(html) &&
+     !/javascript:/i.test(html) &&
+     !/\son\w+=/i.test(html) &&                       // no injected event handlers
+     hrefs.every((h) => h.startsWith('https://')),    // every rendered href is https
+     hrefs.length ? `hrefs: ${hrefs.join(', ')}` : '');
+}
+
 console.log(fail ? `\n${fail} FAILED` : '\nall checks passed');
 process.exit(fail ? 1 : 0);
