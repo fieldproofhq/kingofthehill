@@ -1,0 +1,19 @@
+# King of the Hill — x402 game on the Fieldproof payment stack.
+# Deploy: npx wrangler deploy
+#
+# Secrets are NOT here. They live in Cloudflare's secret store, pushed from the local vault:
+#   CDP_KEY_ID      = fieldproof/cdp-key-id      (Windows Credential Manager)
+#   CDP_KEY_SECRET  = fieldproof/cdp-key-secret  (Windows Credential Manager)
+# Without them the facilitator falls back to testnet and mainnet settlement will not work.
+
+name = "kingofthehill"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+
+[vars]
+PAY_TO = "0x07C2383008a9ed30581f27Db5531E19411c94fb3"
+NETWORK = "eip155:8453"
+
+[[kv_namespaces]]
+binding = "HILL"
+id = "42fe0c38d9544e45b1f5f74026365db1"

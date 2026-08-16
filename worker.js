@@ -1,0 +1,481 @@
+const USDC = {
+  'eip155:8453': { asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', extra: { name: 'USD Coin', version: '2' } },
+  'eip155:84532': { asset: '0x036CbD53842c5426634e7929541eC2318f3dCF7e', extra: { name: 'USDC', version: '2' } },
+};
+
+const CDP_FACILITATOR = 'https://api.cdp.coinbase.com/platform/v2/x402';
+const TESTNET_FACILITATOR = 'https://x402.org/facilitator';
+
+function b64encode(obj) {
+  return btoa(String.fromCharCode(...new TextEncoder().encode(JSON.stringify(obj))));
+}
+function b64decode(str) {
+  try {
+    const bytes = Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+}
+function b64url(bytes) {
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function cfg(env) {
+  const payTo = env.PAY_TO || null;
+  const free = env.FREE_MODE !== undefined ? env.FREE_MODE !== 'false' : !payTo;
+  const network = env.NETWORK || 'eip155:8453';
+  const priceUsd = env.PRICE_USD || '0.005';
+  const amount = String(Math.round(parseFloat(priceUsd) * 1e6)); // USDC 6 decimals
+  const hasCdp = !!(env.CDP_KEY_ID && env.CDP_KEY_SECRET);
+  const facilitator = env.FACILITATOR_URL || (hasCdp ? CDP_FACILITATOR : TESTNET_FACILITATOR);
+  return { payTo, free, network, priceUsd, amount, facilitator, hasCdp };
+}
+
+function pricedCfg(c, priceUsd, quoteDescription) {
+  const price = String(priceUsd);
+  const amount = String(Math.round(Number(price) * 1e6));
+  return { ...c, priceUsd: price, amount, quoteDescription };
+}
+
+function sponsorCfg(c) {
+  return pricedCfg(
+    c,
+    GOAL_USD,
+    'One 42 USDC payment on Base that meets Fieldproof first-$42 external-income bar. The $0.005 self-test is excluded. Self-pays do not count.'
+  );
+}
+
+/** v1 network names vs v2 CAIP-2 ids — the facilitator rejects mixed schemas. */
+const V1_NETWORK = { 'eip155:8453': 'base', 'eip155:84532': 'base-sepolia' };
+
+/** x402 v1 requirements: network NAME, maxAmountRequired, resource/description/mimeType required. */
+function paymentRequirementsV1(c, url) {
+  const token = USDC[c.network] || USDC['eip155:8453'];
+  return {
+    scheme: 'exact',
+    network: V1_NETWORK[c.network] || 'base',
+    maxAmountRequired: c.amount,
+    resource: url,
+    // The 402 is the only thing most callers will ever read. It should answer "why would
+    // I pay this?" without a second request.
+    description:
+      c.quoteDescription ||
+      ('Deterministic allow / require_approval / deny verdict for a proposed agent action. ' +
+        'Same input always yields the same verdict, with the matched rule and rationale returned so it is auditable. ' +
+        'Evaluate before paying — GET /v1/example and GET /v1/policies are free and hide nothing.'),
+    mimeType: 'application/json',
+    payTo: c.payTo,
+    maxTimeoutSeconds: 60,
+    asset: token.asset,
+    extra: token.extra,
+  };
+}
+
+/** x402 v2 requirements: CAIP-2 network, amount; NO resource/description/mimeType here. */
+function paymentRequirementsV2(c) {
+  const token = USDC[c.network] || USDC['eip155:8453'];
+  return {
+    scheme: 'exact',
+    network: c.network,
+    amount: c.amount,
+    asset: token.asset,
+    payTo: c.payTo,
+    maxTimeoutSeconds: 60,
+    extra: token.extra,
+  };
+}
+
+const SELF_TEST_USD = 0.005;
+const GOAL_USD = 42;
+const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const BASE_RPCS = ['https://mainnet.base.org', 'https://base.publicnode.com', 'https://1rpc.io/base'];
+
+async function cdpJwt(env, method, urlStr) {
+  const u = new URL(urlStr);
+  const keyId = env.CDP_KEY_ID;
+  const secret = Uint8Array.from(atob(env.CDP_KEY_SECRET), (c) => c.charCodeAt(0));
+  const seed = secret.slice(0, 32); // CDP Ed25519 secret = 64 bytes (seed || pub)
+  // Wrap raw seed in PKCS8 DER for WebCrypto import:
+  const pkcs8Prefix = Uint8Array.from([
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+  ]);
+  const pkcs8 = new Uint8Array(pkcs8Prefix.length + seed.length);
+  pkcs8.set(pkcs8Prefix), pkcs8.set(seed, pkcs8Prefix.length);
+  const key = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, false, ['sign']);
+  const now = Math.floor(Date.now() / 1000);
+  const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
+  const header = { alg: 'EdDSA', typ: 'JWT', kid: keyId, nonce };
+  const claims = {
+    iss: 'cdp',
+    sub: keyId,
+    aud: ['cdp_service'],
+    nbf: now,
+    exp: now + 120,
+    uri: `${method} ${u.host}${u.pathname}`,
+  };
+  const enc = (o) => b64url(new TextEncoder().encode(JSON.stringify(o)));
+  const signingInput = `${enc(header)}.${enc(claims)}`;
+  const sig = await crypto.subtle.sign('Ed25519', key, new TextEncoder().encode(signingInput));
+  return `${signingInput}.${b64url(new Uint8Array(sig))}`;
+}
+
+async function facilitatorCall(env, c, endpoint, body) {
+  const url = `${c.facilitator}/${endpoint}`;
+  const headers = { 'content-type': 'application/json' };
+  if (c.facilitator.startsWith(CDP_FACILITATOR.slice(0, 30)) && c.hasCdp) {
+    headers.authorization = `Bearer ${await cdpJwt(env, 'POST', url)}`;
+  }
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+  let json = null;
+  try {
+    json = await res.json();
+  } catch {
+    /* non-JSON facilitator error */
+  }
+  return { status: res.status, json };
+}
+
+/* ------------------------------- HTTP layer -------------------------------- */
+
+function corsHeaders() {
+  return {
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-headers': 'content-type, x-payment, payment-signature',
+    'access-control-expose-headers': 'payment-required, payment-response, x-payment-response, x-fieldproof-free',
+  };
+}
+
+
+function json(code, obj, extraHeaders = {}, free = false) {
+  const headers = { 'content-type': 'application/json', ...corsHeaders(), ...extraHeaders };
+  if (free) headers['x-fieldproof-free'] = 'true; x402 pricing live soon - follow @FieldProofAI';
+  return new Response(JSON.stringify(obj, null, 2), { status: code, headers });
+}
+
+/** Bazaar/discovery declaration for the hill. Must ride on the requirements sent to the
+ *  facilitator too, not only on this buyer-facing body — that was the bug that kept
+ *  policy-gate out of the CDP Bazaar for six days (x402-foundation/x402#2112). */
+function hillExtension(origin, priceUsd) {
+  return {
+    bazaar: {
+      info: {
+        input: {
+          type: 'http',
+          method: 'POST',
+          bodyType: 'json',
+          bodyFields: { name: 'your-handle' },
+        },
+        output: {
+          type: 'json',
+          example: {
+            took_the_crown: true,
+            name: 'your-handle',
+            paidUsd: priceUsd,
+            priceToTakeUsd: Math.round(priceUsd * 1.5 * 100) / 100,
+          },
+        },
+      },
+      schema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Display name shown on the board, max 32 chars' },
+        },
+      },
+    },
+  };
+}
+
+function paymentRequired402(c, url, origin, errMsg) {
+  const price = Number(c.priceUsd);
+  const v2 = {
+    x402Version: 2,
+    error: errMsg || 'PAYMENT-SIGNATURE header is required',
+    resource: {
+      url,
+      description:
+        'Take the crown at King of the Hill for $' + price.toFixed(2) +
+        '. The price rises 1.5x for the next challenger, and your share of the board equals your share of everything ever paid.',
+      mimeType: 'application/json',
+      serviceName: 'King of the Hill',
+      tags: ['game', 'auction', 'agents', 'x402'],
+    },
+    accepts: [paymentRequirementsV2(c)],
+    extensions: hillExtension(origin, price),
+  };
+  const v1Body = { x402Version: 1, error: v2.error, accepts: [paymentRequirementsV1(c, url)] };
+  return new Response(JSON.stringify(v1Body, null, 2), {
+    status: 402,
+    headers: {
+      'content-type': 'application/json',
+      'PAYMENT-REQUIRED': b64encode(v2),
+      ...corsHeaders(),
+    },
+  });
+}
+
+/* ========================================================================
+ * KING OF THE HILL — one crown, a rising price, and territory by ratio.
+ *
+ * Take the crown by paying the current price. The price then rises, so the
+ * next challenger pays more than you did. Your share of the canvas is your
+ * share of everything ever paid — not fixed pixels-for-dollars, so it
+ * re-normalises as money arrives.
+ *
+ * Built on the same x402 machinery as policy-gate: one payment
+ * implementation, two products. The 402 quotes the CURRENT price because we
+ * generate the challenge ourselves.
+ * ===================================================================== */
+
+const START_PRICE_USD = 0.5;
+const PRICE_RATIO = 1.5;      // each successful take raises the bar 50%
+const MAX_NAME = 32;
+const HISTORY_KEEP = 50;
+
+const EMPTY_STATE = {
+  king: null,
+  priceUsd: START_PRICE_USD,
+  totalUsd: 0,
+  holders: {},
+  history: [],
+  takes: 0,
+};
+
+async function loadState(env) {
+  if (!env.HILL) return { ...EMPTY_STATE };
+  const raw = await env.HILL.get('state');
+  if (!raw) return { ...EMPTY_STATE };
+  try {
+    return { ...EMPTY_STATE, ...JSON.parse(raw) };
+  } catch {
+    return { ...EMPTY_STATE };
+  }
+}
+
+async function saveState(env, state) {
+  if (env.HILL) await env.HILL.put('state', JSON.stringify(state));
+}
+
+function cleanName(input) {
+  // Allowlist, not denylist: this string is rendered into HTML on the board.
+  const s = String(input ?? '').replace(/[^A-Za-z0-9 ._-]/g, '').trim();
+  if (!s) return 'anonymous';
+  return s.slice(0, MAX_NAME);
+}
+
+function nextPrice(current) {
+  return Math.round(current * PRICE_RATIO * 100) / 100;
+}
+
+/** Territory by ratio: your share of the canvas is your share of all spend. */
+function territory(state) {
+  const total = state.totalUsd || 0;
+  return Object.entries(state.holders)
+    .map(([name, paid]) => ({
+      name,
+      paidUsd: Math.round(paid * 100) / 100,
+      share: total > 0 ? paid / total : 0,
+      sharePct: total > 0 ? Math.round((paid / total) * 1000) / 10 : 0,
+    }))
+    .sort((a, b) => b.paidUsd - a.paidUsd);
+}
+
+function publicState(state) {
+  return {
+    king: state.king,
+    priceToTakeUsd: state.priceUsd,
+    totalRaisedUsd: Math.round(state.totalUsd * 100) / 100,
+    takes: state.takes,
+    territory: territory(state),
+    history: state.history.slice(-10).reverse(),
+    rules: {
+      take: 'POST /claim with {"name":"you"} and an x402 payment of the current price',
+      escalation: `each take multiplies the next price by ${PRICE_RATIO}`,
+      territory: 'your share of the canvas equals your share of all money ever paid',
+    },
+  };
+}
+
+function board(state, origin) {
+  const t = territory(state);
+  const king = state.king;
+  const TOTAL_TILES = 400; // 20x20
+  const tiles = [];
+  let assigned = 0;
+  t.forEach((h, i) => {
+    const n = Math.max(h.paidUsd > 0 ? 1 : 0, Math.round(h.share * TOTAL_TILES));
+    for (let k = 0; k < n && assigned < TOTAL_TILES; k++, assigned++) tiles.push(i);
+  });
+  while (assigned < TOTAL_TILES) { tiles.push(-1); assigned++; }
+
+  const hue = (i) => (i < 0 ? '#171b22' : 'hsl(' + ((i * 67) % 360) + ' 70% 55%)');
+  const cells = tiles.map((i) => '<i style="background:' + hue(i) + '"></i>').join('');
+  const rows = t.map((h, i) =>
+    '<tr><td><b style="color:' + hue(i) + '">&#9632;</b> ' + h.name + '</td><td>$' +
+    h.paidUsd.toFixed(2) + '</td><td>' + h.sharePct + '%</td></tr>'
+  ).join('') || '<tr><td colspan="3">nobody yet &mdash; the hill is empty</td></tr>';
+
+  const kingLine = king
+    ? '<b>' + king.name + '</b> <span style="opacity:.6">since ' +
+      new Date(king.at).toISOString().slice(0, 16).replace('T', ' ') + 'Z</span>'
+    : '<b>nobody</b>';
+
+  const curl = [
+    'curl -s -X POST ' + origin + '/claim \\',
+    "  -H 'content-type: application/json' \\",
+    '  -d \'{"name":"your-handle"}\'',
+    '# -> 402 with x402 payment instructions for the current price',
+  ].join('\n');
+
+  return '<!doctype html><meta charset=utf-8><title>King of the Hill</title>' +
+'<meta name=viewport content="width=device-width,initial-scale=1">' +
+'<style>' +
+':root{color-scheme:dark}' +
+'body{font:15px/1.55 ui-sans-serif,system-ui,sans-serif;max-width:760px;margin:2rem auto;padding:0 1rem;background:#0b0d10;color:#e8eaed}' +
+'h1{font-size:1.6rem;margin:0 0 .2rem}.sub{opacity:.7;margin:0 0 1.4rem}' +
+'.crown{border:1px solid #2a2f3a;border-radius:10px;padding:1rem 1.2rem;margin:0 0 1.2rem;background:#12151b}' +
+'.price{font-size:2rem;font-weight:700;letter-spacing:-.02em}' +
+'#grid{display:grid;grid-template-columns:repeat(20,1fr);gap:2px;margin:1.2rem 0}' +
+'#grid i{aspect-ratio:1;border-radius:2px;display:block}' +
+'table{width:100%;border-collapse:collapse;margin:.6rem 0 1.4rem}' +
+'td{padding:.35rem .2rem;border-bottom:1px solid #1e222b}' +
+'pre{background:#12151b;border:1px solid #222733;border-radius:8px;padding:.9rem;overflow-x:auto}' +
+'a{color:#7cc4ff}' +
+'</style>' +
+'<h1>&#128081; King of the Hill</h1>' +
+'<p class=sub>One crown. A rising price. Territory by ratio.</p>' +
+'<div class=crown><div>current king &mdash; ' + kingLine + '</div>' +
+'<div class=price>$' + state.priceUsd.toFixed(2) +
+' <span style="font-size:.9rem;font-weight:400;opacity:.7">to take it</span></div>' +
+'<div style="opacity:.7;margin-top:.4rem">$' + (Math.round(state.totalUsd * 100) / 100).toFixed(2) +
+' raised across ' + state.takes + ' take' + (state.takes === 1 ? '' : 's') + '</div></div>' +
+'<div id=grid>' + cells + '</div>' +
+'<table>' + rows + '</table>' +
+'<p>Your share of the canvas is your share of <em>everything ever paid</em>, so it re-normalises every time someone else buys in. Taking the crown raises the price ' + PRICE_RATIO + '&times; for whoever comes next.</p>' +
+'<pre>' + curl.replace(/</g, '&lt;') + '</pre>' +
+'<p style="opacity:.7">Paid in USDC on Base via <a href="https://x402.org">x402</a>. ' +
+'State: <a href="' + origin + '/api/state">/api/state</a> &middot; ' +
+'<a href="' + origin + '/.well-known/x402">discovery</a> &middot; built by ' +
+'<a href="https://x.com/FieldProofAI">@FieldProofAI</a>, an AI-run business. Every dollar here is public and on-chain.</p>';
+}
+
+async function crown(env, state, name, paidUsd) {
+  const at = new Date().toISOString();
+  state.king = { name, at, paidUsd };
+  state.holders[name] = (state.holders[name] || 0) + paidUsd;
+  state.totalUsd += paidUsd;
+  state.takes += 1;
+  state.history.push({ name, paidUsd, at });
+  if (state.history.length > HISTORY_KEEP) state.history = state.history.slice(-HISTORY_KEEP);
+  state.priceUsd = nextPrice(paidUsd);
+  await saveState(env, state);
+  return state;
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const c = cfg(env);
+
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders() });
+    if (request.method === 'GET' && url.pathname === '/healthz') return json(200, { ok: true }, {}, true);
+
+    const state = await loadState(env);
+
+    if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '')) {
+      return new Response(board(state, url.origin), {
+        status: 200,
+        headers: { 'content-type': 'text/html; charset=utf-8', ...corsHeaders() },
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/api/state') {
+      return json(200, publicState(state), {}, true);
+    }
+
+    // Domain-ownership proof for 402index.io. This is the SHA-256 hash of a verification
+    // token, not the token — the hash is public by design and the token is in no file.
+    if (request.method === 'GET' && url.pathname === '/.well-known/402index-verify.txt') {
+      return new Response('e0555be30fa7a28ba9f1c2863e510464dae57c74035276209f6aa3d4ea4be669', {
+        status: 200,
+        headers: { 'content-type': 'text/plain; charset=utf-8', ...corsHeaders() },
+      });
+    }
+
+    // Discovery manifest. Crawlers look here first — learned the hard way today.
+    if (request.method === 'GET' && url.pathname === '/.well-known/x402') {
+      const priced = pricedCfg(c, state.priceUsd, 'Take the crown');
+      return json(200, {
+        x402Version: 2,
+        serviceName: 'King of the Hill',
+        description: 'Pay the current price to take the crown. The price rises each take. Territory is proportional to total spend.',
+        tags: ['game', 'x402', 'agents', 'auction'],
+        resources: [{
+          url: url.origin + '/claim',
+          method: 'POST',
+          mimeType: 'application/json',
+          description: 'Take the crown at the current price',
+          accepts: c.free ? [] : [paymentRequirementsV2(priced)],
+          dynamicPricing: true,
+          currentPriceUsd: state.priceUsd,
+        }],
+        state: url.origin + '/api/state',
+      }, {}, true);
+    }
+
+    // GET on the paid route documents it and returns 200: a non-2xx GET reads as a dead
+    // service to directory health probes.
+    if (request.method === 'GET' && url.pathname === '/claim') {
+      const priced = pricedCfg(c, state.priceUsd, 'Take the crown');
+      return json(200, {
+        endpoint: url.origin + '/claim',
+        method: 'POST',
+        body: { name: 'your-handle' },
+        currentPriceUsd: state.priceUsd,
+        accepts: c.free ? [] : [paymentRequirementsV1(priced, url.origin + '/claim')],
+        note: 'POST without payment returns 402 with signing instructions for the current price.',
+      }, {}, true);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/claim') {
+      let body = {};
+      try { body = JSON.parse((await request.text()) || '{}'); } catch { /* name is optional */ }
+      const name = cleanName(body.name);
+      const priced = pricedCfg(c, state.priceUsd, 'Take the crown as ' + name);
+
+      if (c.free) {
+        const out = await crown(env, state, name, state.priceUsd);
+        return json(200, { free: true, took_the_crown: true, name, ...publicState(out) }, {}, true);
+      }
+
+      const payHeader = request.headers.get('payment-signature') || request.headers.get('x-payment');
+      if (!payHeader) return paymentRequired402(priced, url.href, url.origin);
+
+      const payload = b64decode(payHeader);
+      if (!payload) return paymentRequired402(priced, url.href, url.origin, 'malformed payment header');
+
+      const ver = payload.x402Version === 2 ? 2 : 1;
+      const reqs = ver === 2 ? paymentRequirementsV2(priced) : paymentRequirementsV1(priced, url.href);
+      const verifyBody = { x402Version: ver, paymentPayload: payload, paymentRequirements: reqs };
+
+      const verify = await facilitatorCall(env, priced, 'verify', verifyBody);
+      if (!verify.json || verify.json.isValid !== true) {
+        return paymentRequired402(priced, url.href, url.origin,
+          'payment verification failed: ' + (verify.json && verify.json.invalidReason ? verify.json.invalidReason : 'facilitator ' + verify.status));
+      }
+
+      const settle = await facilitatorCall(env, priced, 'settle', verifyBody);
+      if (!settle.json || settle.json.success !== true) {
+        return paymentRequired402(priced, url.href, url.origin,
+          'settlement failed: ' + (settle.json && settle.json.errorReason ? settle.json.errorReason : 'facilitator ' + settle.status));
+      }
+
+      const paid = state.priceUsd;
+      const out = await crown(env, state, name, paid);
+      return json(200, { took_the_crown: true, name, paidUsd: paid, ...publicState(out) });
+    }
+
+    return json(404, { error: 'not_found', try: ['GET /', 'GET /api/state', 'POST /claim'] }, {}, true);
+  },
+};
