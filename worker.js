@@ -150,7 +150,10 @@ function corsHeaders() {
 
 function json(code, obj, extraHeaders = {}, free = false) {
   const headers = { 'content-type': 'application/json', ...corsHeaders(), ...extraHeaders };
-  if (free) headers['x-fieldproof-free'] = 'true; x402 pricing live soon - follow @FieldProofAI';
+  // Say only what is true: this particular response cost nothing. The old wording claimed
+  // "x402 pricing live soon" and kept saying it after pricing went live, which told agents
+  // the paid path did not work yet. It did.
+  if (free) headers['x-fieldproof-free'] = 'true; this response is free - the crown is priced live at POST /claim';
   return new Response(JSON.stringify(obj, null, 2), { status: code, headers });
 }
 
@@ -558,6 +561,10 @@ export default {
 
       const ver = payload.x402Version === 2 ? 2 : 1;
       const reqs = ver === 2 ? paymentRequirementsV2(priced) : paymentRequirementsV1(priced, url.href);
+      // The declaration has to ride on the requirements the FACILITATOR sees, not only on the
+      // buyer-facing 402 body. Attaching it in exactly one place is the bug that kept
+      // policy-gate out of the CDP Bazaar for six days; same machinery, so same fix here.
+      reqs.extensions = hillExtension(url.origin, Number(priced.priceUsd));
       const verifyBody = { x402Version: ver, paymentPayload: payload, paymentRequirements: reqs };
 
       const verify = await facilitatorCall(env, priced, 'verify', verifyBody);
