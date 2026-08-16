@@ -197,5 +197,20 @@ for (const [accept, want, why] of acceptCases) {
      descs.every((d) => d.length <= 500), `longest ${Math.max(0, ...descs.map((d) => d.length))}`);
 }
 
+// 10. Whatever a human is told before paying, an agent must be told too. The board's HTML
+//     disclosed that territory re-normalises while the machine-readable rules did not.
+{
+  const state = await (await call('/api/state')).json();
+  const html = await (await call('/', { headers: { accept: 'text/html' } })).text();
+  const rules = JSON.stringify(state.rules || {}).toLowerCase();
+
+  ok('rules disclose that territory dilutes', /shrink|re-?normalis|dilut/.test(rules));
+  ok('rules disclose that money is not returned', /not returned|no refund|no payout/.test(rules));
+  ok('rules mention the optional link', /url|link/.test(rules));
+
+  // Both audiences get the dilution warning, not just the one reading a browser.
+  ok('the HTML board says it too', /re-?normalis|shrink/i.test(html));
+}
+
 console.log(fail ? `\n${fail} FAILED` : '\nall checks passed');
 process.exit(fail ? 1 : 0);

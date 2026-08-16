@@ -348,10 +348,20 @@ function publicState(state) {
     takes: state.takes,
     territory: territory(state),
     history: state.history.slice(-10).reverse(),
+    // The HTML board warned humans that territory re-normalises and the machine-readable
+    // rules did not, which meant a browsing person was told something an agent buyer was
+    // not. Same disclosure, same words, whoever is reading.
     rules: {
       take: 'POST /claim with {"name":"you"} and an x402 payment of the current price',
       escalation: `each take multiplies the next price by ${PRICE_RATIO}`,
       territory: 'your share of the canvas equals your share of all money ever paid',
+      dilution:
+        'that share is a ratio, not a holding: it shrinks every time anyone else pays, ' +
+        'and it is not reserved, guaranteed, or restorable',
+      no_refund:
+        'money paid is not returned. There is no payout, resale, dividend, or claim on the ' +
+        'pot, and later takes do not pay earlier holders. You are buying a place on a board',
+      links: 'an optional https url in the body points your territory somewhere; rendered nofollow',
     },
   };
 }
