@@ -580,8 +580,29 @@ export default {
       }
 
       const paid = state.priceUsd;
-      const out = await crown(env, state, name, paid);
-      return json(200, { took_the_crown: true, name, paidUsd: paid, ...publicState(out) });
+      const receipt = settle.json.transaction || settle.json.txHash || settle.json.payer || null;
+
+      // Money has moved by this line. If recording the take then fails, the one thing we must
+      // not do is throw a 500 and leave a paying agent with nothing and no evidence — that is
+      // the "paid and received nothing" failure, and it would be entirely our bug. Hand back
+      // the settlement reference and say plainly which half succeeded.
+      try {
+        const out = await crown(env, state, name, paid);
+        return json(200, { took_the_crown: true, name, paidUsd: paid, settlement: receipt, ...publicState(out) });
+      } catch (err) {
+        return json(200, {
+          took_the_crown: false,
+          settled: true,
+          recorded: false,
+          name,
+          paidUsd: paid,
+          settlement: receipt,
+          error: 'payment settled, but the board failed to record it',
+          what_to_do:
+            'Keep this settlement reference. Open an issue at ' +
+            'https://github.com/fieldproofhq/kingofthehill/issues with it and the crown will be applied by hand.',
+        });
+      }
     }
 
     return json(404, { error: 'not_found', try: ['GET /', 'GET /api/state', 'POST /claim'] }, {}, true);

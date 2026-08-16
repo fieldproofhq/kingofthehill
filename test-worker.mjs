@@ -72,5 +72,36 @@ const rFree = await call('/api/state');
 const fh = rFree.headers.get('x-fieldproof-free');
 ok('no stale "pricing live soon" claim anywhere', !/live soon/.test(fh || ''), `-> ${fh ?? '(absent)'}`);
 
+// 6. A paying agent must never be left with nothing. Make the facilitator settle
+//    successfully and then make the KV write fail, which is the one ordering where money
+//    has already moved. The request must not throw, and the response must say plainly
+//    that the payment settled while the board did not record it.
+globalThis.fetch = async (u, init) => {
+  const url = String(u?.url || u);
+  if (url.includes('/verify')) {
+    return new Response(JSON.stringify({ isValid: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url.includes('/settle')) {
+    return new Response(JSON.stringify({ success: true, transaction: '0xdeadbeef' }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+};
+const brokenEnv = { ...env, HILL: { get: async () => null, put: async () => { throw new Error('KV unavailable'); } } };
+let threw = false;
+let recovered = null;
+try {
+  const r = await mod.fetch(new Request(B + '/claim', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'payment-signature': fakePayload },
+    body: JSON.stringify({ name: 'smoke' }),
+  }), brokenEnv, ctx);
+  recovered = await r.json();
+} catch { threw = true; }
+ok('settle-then-KV-failure does not throw', !threw);
+ok('response admits the payment settled', recovered?.settled === true);
+ok('response admits the board did not record it', recovered?.recorded === false);
+ok('response does NOT claim the crown', recovered?.took_the_crown === false);
+ok('response hands back a settlement reference', !!recovered?.settlement, `-> ${recovered?.settlement}`);
+
 console.log(fail ? `\n${fail} FAILED` : '\nall checks passed');
 process.exit(fail ? 1 : 0);
