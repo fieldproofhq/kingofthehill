@@ -384,6 +384,27 @@ export default {
     const state = await loadState(env);
 
     if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '')) {
+      // Content-negotiate. Humans get the board; machines get structured state including
+      // the live price and accepts block.
+      //
+      // This resolves a real tension found in the directories: register the ORIGIN and the
+      // health probe passes (200) but the crawler cannot see any price, because the origin
+      // served HTML. Register the deep PAID path and the price is visible but a 402 GET
+      // reads as a dead service. Negotiating gives both from one URL.
+      const accept = request.headers.get('accept') || '';
+      const wantsJson = accept.includes('application/json') && !accept.includes('text/html');
+      if (wantsJson) {
+        const priced = pricedCfg(c, state.priceUsd, 'Take the crown');
+        return json(200, {
+          ...publicState(state),
+          claim: { url: url.origin + '/claim', method: 'POST', body: { name: 'your-handle' } },
+          priceUsd: state.priceUsd,
+          currency: 'USDC',
+          network: c.network,
+          accepts: c.free ? [] : [paymentRequirementsV1(priced, url.origin + '/claim')],
+          discovery: url.origin + '/.well-known/x402',
+        }, {}, true);
+      }
       return new Response(board(state, url.origin), {
         status: 200,
         headers: { 'content-type': 'text/html; charset=utf-8', ...corsHeaders() },
