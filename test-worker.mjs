@@ -141,5 +141,26 @@ for (const [candidate, shouldStick, why] of linkCases) {
      hrefs.length ? `hrefs: ${hrefs.join(', ')}` : '');
 }
 
+// 8. Directory crawlers and health probes do not send `Accept: application/json`. They send
+//    `*/*`, or nothing at all. Every one of those must see the price, or the listing goes
+//    health:down with x402_ok:0 while the service is perfectly fine.
+const acceptCases = [
+  [undefined, 'json', 'no Accept header at all'],
+  ['*/*', 'json', 'Accept: */* (curl, most crawlers)'],
+  ['application/json', 'json', 'explicit json'],
+  ['application/json, text/plain, */*', 'json', 'typical http client'],
+  ['text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'html', 'a real browser'],
+];
+for (const [accept, want, why] of acceptCases) {
+  const r = await call('/', accept === undefined ? undefined : { headers: { accept } });
+  const ct = r.headers.get('content-type') || '';
+  const isJson = ct.includes('application/json');
+  ok(`root serves ${want}: ${why}`, want === 'json' ? isJson : ct.includes('text/html'), `-> ${ct.split(';')[0]}`);
+  if (want === 'json') {
+    const b = await r.json();
+    ok(`  ...and the price is visible: ${why}`, b.accepts?.[0]?.maxAmountRequired === '500000' || b.priceToTakeUsd === 0.5);
+  }
+}
+
 console.log(fail ? `\n${fail} FAILED` : '\nall checks passed');
 process.exit(fail ? 1 : 0);

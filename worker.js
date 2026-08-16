@@ -436,8 +436,13 @@ export default {
       // health probe passes (200) but the crawler cannot see any price, because the origin
       // served HTML. Register the deep PAID path and the price is visible but a 402 GET
       // reads as a dead service. Negotiating gives both from one URL.
+      // Machine-readable is the DEFAULT; HTML requires asking for it. Browsers always name
+      // text/html explicitly, but crawlers and health probes send `*/*` or no Accept at all.
+      // The old rule required `application/json` to be named, so those probes got the board,
+      // saw no price, and recorded x402_ok:0 — which is precisely why the agent-tools listing
+      // sat at health:down while the service was fine.
       const accept = request.headers.get('accept') || '';
-      const wantsJson = accept.includes('application/json') && !accept.includes('text/html');
+      const wantsJson = !accept.includes('text/html');
       if (wantsJson) {
         const priced = pricedCfg(c, state.priceUsd, 'Take the crown');
         return json(200, {
