@@ -133,7 +133,23 @@ async function facilitatorCall(env, c, endpoint, body) {
   } catch {
     /* non-JSON facilitator error */
   }
-  return { status: res.status, json };
+
+  // The ONLY place the facilitator says whether our bazaar declaration was accepted is this
+  // header, base64 JSON keyed by extension name: { bazaar: { status, rejectedReason } }.
+  // Discarding it is why a malformed declaration can sit rejected for days while every other
+  // signal reads healthy — the payment settles, nothing errors, and the resource is simply
+  // never cataloged. Read it, and surface it.
+  let extensions = null;
+  const raw = res.headers.get('EXTENSION-RESPONSES');
+  if (raw) {
+    try {
+      extensions = JSON.parse(atob(raw));
+    } catch {
+      extensions = { parseError: raw.slice(0, 200) };
+    }
+    console.log('EXTENSION-RESPONSES', endpoint, JSON.stringify(extensions));
+  }
+  return { status: res.status, json, extensions };
 }
 
 /* ------------------------------- HTTP layer -------------------------------- */
@@ -651,8 +667,17 @@ export default {
 
       const verify = await facilitatorCall(env, priced, 'verify', verifyBody);
       if (!verify.json || verify.json.isValid !== true) {
-        return paymentRequired402(priced, url.href, url.origin,
+        const res402 = paymentRequired402(priced, url.href, url.origin,
           'payment verification failed: ' + (verify.json && verify.json.invalidReason ? verify.json.invalidReason : 'facilitator ' + verify.status));
+        // Echo the facilitator's verdict on our discovery declaration. A rejected declaration
+        // is otherwise invisible from outside, and this makes it observable without needing a
+        // settlement to find out.
+        if (verify.extensions) {
+          const out = new Response(res402.body, res402);
+          out.headers.set('x-bazaar-status', JSON.stringify(verify.extensions).slice(0, 400));
+          return out;
+        }
+        return res402;
       }
 
       const settle = await facilitatorCall(env, priced, 'settle', verifyBody);
