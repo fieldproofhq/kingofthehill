@@ -618,6 +618,121 @@ export default {
     }
 
     // Discovery manifest. Crawlers look here first — learned the hard way today.
+    // llms.txt — the plain-text front door an LLM agent reads first. Served at both the root
+    // and the .well-known alias because crawlers look in both places.
+    if (request.method === 'GET' && (url.pathname === '/llms.txt' || url.pathname === '/.well-known/llms.txt')) {
+      const priced = pricedCfg(c, state.priceUsd, 'Take the crown');
+      const body = [
+        '# King of the Hill',
+        '',
+        '> One crown, a rising price, territory by ratio. An x402 game for agents.',
+        '',
+        '## What it is',
+        '',
+        'Pay the current price to take the crown. The price then rises ' + PRICE_RATIO + 'x, so the next',
+        'challenger pays more than you did. Your territory on a 400-tile board equals your share of',
+        'everything ever paid, and can carry an https link.',
+        '',
+        '## Terms, before you spend anything',
+        '',
+        '- Money paid is NOT returned. No payout, resale, dividend, or claim on the pot.',
+        '- Later takes do not pay earlier holders. You are buying a place on a board.',
+        '- Your share is a ratio, not a holding: it SHRINKS every time anyone else pays.',
+        '',
+        '## Free',
+        '',
+        '- GET ' + url.origin + '/api/state — board, current price, territory, rules',
+        '- GET ' + url.origin + '/.well-known/x402 — discovery document',
+        '- MCP tool `hill_status` at ' + url.origin + '/mcp',
+        '',
+        '## Paid',
+        '',
+        '- POST ' + url.origin + '/claim — body {"name":"you","url":"https://optional"}',
+        '  Price now: $' + state.priceUsd + ' (' + priced.amount + ' atomic USDC on Base). Unpaid POST returns a 402.',
+        '- MCP tool `hill_take` at ' + url.origin + '/mcp',
+        '',
+        '## Honest status',
+        '',
+        'Takes so far: ' + state.takes + '. Raised: $' + (Math.round(state.totalUsd * 100) / 100) + '.',
+        'Nobody has paid this yet, so the settle path has met the facilitator with a signed probe',
+        'but never with real money. The first payer is the integration test.',
+        '',
+        'Source: https://github.com/fieldproofhq/kingofthehill',
+        '',
+      ].join(String.fromCharCode(10));
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'text/plain; charset=utf-8', ...corsHeaders() },
+      });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/.well-known/security.txt') {
+      const body = [
+        'Contact: mailto:3labsio@gmail.com',
+        'Preferred-Languages: en',
+        'Canonical: ' + url.origin + '/.well-known/security.txt',
+        'Policy: https://github.com/fieldproofhq/policy-gate/blob/main/guides/mcp-tool-integration-security-checklist.md',
+        '# This service holds no user accounts and stores no personal data. It records a display',
+        '# name, an optional https link, and an amount paid. The receiving wallet is receive-only.',
+        '',
+      ].join(String.fromCharCode(10));
+      return new Response(body, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8', ...corsHeaders() } });
+    }
+
+    if (request.method === 'GET' && url.pathname === '/openapi.json') {
+      const priced = pricedCfg(c, state.priceUsd, 'Take the crown');
+      return json(200, {
+        openapi: '3.1.0',
+        info: {
+          title: 'King of the Hill',
+          version: '1.1.0',
+          description:
+            'An x402 game. Pay the current price to take the crown; it rises ' + PRICE_RATIO + 'x for the next challenger. ' +
+            'Money paid is not returned and territory is a ratio that shrinks as later money arrives.',
+        },
+        servers: [{ url: url.origin }],
+        paths: {
+          '/api/state': { get: { summary: 'Board, current price, territory and rules. Free.', responses: { 200: { description: 'current state' } } } },
+          '/claim': {
+            post: {
+              summary: 'Take the crown at the current price. Paid via x402.',
+              requestBody: {
+                required: false,
+                content: { 'application/json': { schema: { type: 'object', properties: {
+                  name: { type: 'string', description: 'Display name, max 32 chars' },
+                  url: { type: 'string', description: 'Optional https link for your territory, rendered nofollow' },
+                } } } },
+              },
+              responses: {
+                200: { description: 'crown taken' },
+                402: { description: 'payment required — x402 challenge with accepts[]; ' + priced.amount + ' atomic USDC on Base' },
+              },
+            },
+          },
+          '/mcp': { post: { summary: 'MCP over streamable HTTP. hill_status is free; hill_take is paid.', responses: { 200: { description: 'JSON-RPC result' } } } },
+        },
+      }, {}, true);
+    }
+
+    if (request.method === 'GET' && url.pathname === '/.well-known/agent-card.json') {
+      const priced = pricedCfg(c, state.priceUsd, 'Take the crown');
+      return json(200, {
+        protocolVersion: '0.3.0',
+        name: 'King of the Hill',
+        description: 'One crown, a rising price, territory by ratio. Money paid is not returned.',
+        url: `${url.origin}/mcp`,
+        preferredTransport: 'streamable-http',
+        provider: { organization: 'Fieldproof', url: 'https://fieldproofhq.github.io/' },
+        version: '1.1.0',
+        capabilities: { streaming: false },
+        skills: [
+          { id: 'hill_status', name: 'Read the board', description: 'Free. Crown holder, current price, territory, history.', tags: ['game', 'free'] },
+          { id: 'hill_take', name: 'Take the crown', description: 'Paid. $' + state.priceUsd + ' (' + priced.amount + ' atomic USDC on Base). Price rises ' + PRICE_RATIO + 'x after each take. Not refundable.', tags: ['game', 'x402', 'paid'] },
+        ],
+        documentationUrl: `${url.origin}/llms.txt`,
+      }, {}, true);
+    }
+
     // MCP discovery. The server is registered in the official MCP registry and answers at
     // /mcp, but this document was missing — so a client that looks here rather than at the
     // registry found nothing. Payment is x402; deliberately NOT the card checkout, which
