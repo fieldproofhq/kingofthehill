@@ -13,6 +13,8 @@ compatibility_date = "2026-08-01"
 [vars]
 PAY_TO = "0x07C2383008a9ed30581f27Db5531E19411c94fb3"
 NETWORK = "eip155:8453"
+# Ed25519 PUBLIC key for MCP-registry domain proof. Public by design; the private half is not here.
+MCP_REGISTRY_PUBKEY = "HNkz/udRpwUVvLhWGOyWk41WW7/OTo/b7mZT0aWXCAg="
 
 [[kv_namespaces]]
 binding = "HILL"

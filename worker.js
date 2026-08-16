@@ -411,6 +411,86 @@ export default {
       });
     }
 
+    // MCP (Streamable HTTP). An agent browsing a registry can read the board for free and
+    // take the crown by paying — the game is playable from inside a tool client, which is
+    // where agents already are.
+    if (url.pathname === '/mcp') {
+      if (request.method === 'GET') {
+        return json(200, { transport: 'streamable-http', protocol: 'mcp', tools: ['hill_status', 'hill_take'] }, {}, true);
+      }
+      if (request.method !== 'POST') return json(405, { error: 'method_not_allowed' }, {}, true);
+
+      let rpc;
+      try { rpc = JSON.parse((await request.text()) || '{}'); }
+      catch { return json(200, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }, {}, true); }
+      const reply = (result) => json(200, { jsonrpc: '2.0', id: rpc.id ?? null, result }, {}, true);
+      const fail = (code, message) => json(200, { jsonrpc: '2.0', id: rpc.id ?? null, error: { code, message } }, {}, true);
+
+      const TOOLS = [
+        {
+          name: 'hill_status',
+          description: 'Free. Who holds the crown, what it costs to take it right now, how much has been raised, and each holder\'s share of the board.',
+          inputSchema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'hill_take',
+          description:
+            'Take the crown at the current price, paid in USDC on Base via x402. The price rises 1.5x for the next challenger. Returns payment instructions when unpaid.',
+          inputSchema: {
+            type: 'object',
+            properties: { name: { type: 'string', description: 'Display name for the board, max 32 chars' } },
+          },
+        },
+      ];
+
+      switch (rpc.method) {
+        case 'initialize':
+          return reply({
+            protocolVersion: typeof rpc.params?.protocolVersion === 'string' ? rpc.params.protocolVersion : '2025-06-18',
+            capabilities: { tools: {} },
+            serverInfo: { name: 'king-of-the-hill', version: '1.0' },
+            instructions:
+              'One crown, a rising price, territory by ratio. hill_status is free; hill_take costs the current price and raises it 1.5x for whoever comes next.',
+          });
+        case 'notifications/initialized':
+          return new Response(null, { status: 202, headers: corsHeaders() });
+        case 'ping':
+          return reply({});
+        case 'tools/list':
+          return reply({ tools: TOOLS });
+        case 'tools/call': {
+          const text = (obj) => reply({ content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] });
+          if (rpc.params?.name === 'hill_status') return text(publicState(state));
+          if (rpc.params?.name === 'hill_take') {
+            const nm = cleanName(rpc.params?.arguments?.name);
+            if (c.free) {
+              const out = await crown(env, state, nm, state.priceUsd);
+              return text({ took_the_crown: true, name: nm, ...publicState(out) });
+            }
+            const priced = pricedCfg(c, state.priceUsd, 'Take the crown as ' + nm);
+            return text({
+              payment_required: true,
+              price_usd: state.priceUsd,
+              endpoint: url.origin + '/claim',
+              accepts: [paymentRequirementsV1(priced, url.origin + '/claim')],
+              how: 'POST /claim with {"name":"..."} and an X-PAYMENT header (x402). hill_status is free.',
+            });
+          }
+          return fail(-32602, `Unknown tool: ${rpc.params?.name}`);
+        }
+        default:
+          return fail(-32601, `Method not found: ${rpc.method}`);
+      }
+    }
+
+    // Domain proof for the official MCP registry (public key half only).
+    if (request.method === 'GET' && url.pathname === '/.well-known/mcp-registry-auth') {
+      return new Response('v=MCPv1; k=ed25519; p=' + (env.MCP_REGISTRY_PUBKEY || ''), {
+        status: 200,
+        headers: { 'content-type': 'text/plain; charset=utf-8', ...corsHeaders() },
+      });
+    }
+
     if (request.method === 'GET' && url.pathname === '/api/state') {
       return json(200, publicState(state), {}, true);
     }
