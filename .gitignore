@@ -1,2 +1,3 @@
-.wrangler/
+# stray probe output from shell passes
+*.txt
 node_modules/
