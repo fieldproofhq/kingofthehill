@@ -618,6 +618,41 @@ export default {
     }
 
     // Discovery manifest. Crawlers look here first — learned the hard way today.
+    // MCP discovery. The server is registered in the official MCP registry and answers at
+    // /mcp, but this document was missing — so a client that looks here rather than at the
+    // registry found nothing. Payment is x402; deliberately NOT the card checkout, which
+    // delivers a different product entirely.
+    if (request.method === 'GET' && url.pathname === '/.well-known/mcp.json') {
+      const priced = pricedCfg(c, state.priceUsd, 'Take the crown');
+      return json(200, {
+        version: '1.0',
+        name: 'king-of-the-hill',
+        description:
+          'One crown, a rising price, territory by ratio. hill_status is free; hill_take takes the crown at the current price and raises it ' +
+          PRICE_RATIO + 'x for whoever comes next. Money paid is not returned.',
+        transport: 'streamable-http',
+        url: `${url.origin}/mcp`,
+        tools: ['hill_status', 'hill_take'],
+        free: ['hill_status'],
+        paid: ['hill_take'],
+        payment: {
+          scheme: 'x402',
+          network: c.network,
+          asset: 'USDC',
+          amountUsd: Number(state.priceUsd),
+          amountAtomic: priced.amount,
+          payTo: c.payTo,
+          note: 'Price rises ' + PRICE_RATIO + 'x per take, so this amount is current rather than fixed.',
+        },
+        terms: {
+          refund: 'none — money paid is not returned, and later takes do not pay earlier holders',
+          territory: 'a share of the board equal to your share of all money ever paid; it shrinks as later money arrives',
+        },
+        discovery: `${url.origin}/.well-known/x402`,
+        state: `${url.origin}/api/state`,
+      }, {}, true);
+    }
+
     if (request.method === 'GET' && url.pathname === '/.well-known/x402') {
       const priced = pricedCfg(c, state.priceUsd, 'Take the crown');
       return json(200, {
