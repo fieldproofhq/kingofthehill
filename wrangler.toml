@@ -4,6 +4,8 @@
 # Secrets are NOT here. They live in Cloudflare's secret store, pushed from the local vault:
 #   CDP_KEY_ID      = fieldproof/cdp-key-id      (Windows Credential Manager)
 #   CDP_KEY_SECRET  = fieldproof/cdp-key-secret  (Windows Credential Manager)
+# The MCP-registry signing key is fieldproof/mcp-registry-hill in the same vault; only its
+# public half appears below.
 # Without them the facilitator falls back to testnet and mainnet settlement will not work.
 
 name = "kingofthehill"
@@ -14,7 +16,7 @@ compatibility_date = "2026-08-01"
 PAY_TO = "0x07C2383008a9ed30581f27Db5531E19411c94fb3"
 NETWORK = "eip155:8453"
 # Ed25519 PUBLIC key for MCP-registry domain proof. Public by design; the private half is not here.
-MCP_REGISTRY_PUBKEY = "HNkz/udRpwUVvLhWGOyWk41WW7/OTo/b7mZT0aWXCAg="
+MCP_REGISTRY_PUBKEY = "yMqa12HW8w/Y+3UND7rCIjJOeZ4FrC0aVnwGsF2B/F8="
 
 [[kv_namespaces]]
 binding = "HILL"
