@@ -162,5 +162,40 @@ for (const [accept, want, why] of acceptCases) {
   }
 }
 
+// 9. The bazaar declaration is validated by the facilitator BEFORE cataloging, and a failure
+//    is invisible except in an EXTENSION-RESPONSES header on verify/settle. So assert the
+//    spec's rules here rather than discovering them after paying for a settlement.
+{
+  const r = await call('/claim', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ name: 'schemacheck' }),
+  });
+  const v2 = JSON.parse(Buffer.from(r.headers.get('PAYMENT-REQUIRED'), 'base64').toString('utf8'));
+  const bz = v2.extensions?.bazaar;
+  const info = bz?.info, schema = bz?.schema;
+
+  ok('bazaar: schema declares Draft 2020-12', schema?.$schema === 'https://json-schema.org/draft/2020-12/schema', `-> ${schema?.$schema}`);
+  ok('bazaar: schema requires an input property', Array.isArray(schema?.required) && schema.required.includes('input'));
+  ok('bazaar: schema defines properties.input', !!schema?.properties?.input);
+  ok('bazaar: input.type is pinned to "http"', schema?.properties?.input?.properties?.type?.const === 'http');
+
+  // The real trap: additionalProperties:false means any key in info.input that the schema
+  // does not name invalidates the whole declaration.
+  const allowed = Object.keys(schema?.properties?.input?.properties || {});
+  const extra = Object.keys(info?.input || {}).filter((k) => !allowed.includes(k));
+  ok('bazaar: info.input has no key the schema rejects', extra.length === 0, extra.length ? `stray: ${extra.join(', ')}` : '');
+
+  const missing = (schema?.properties?.input?.required || []).filter((k) => !(k in (info?.input || {})));
+  ok('bazaar: info.input carries every required key', missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : '');
+
+  ok('bazaar: declared method is in the schema enum',
+     (schema?.properties?.input?.properties?.method?.enum || []).includes(info?.input?.method), `-> ${info?.input?.method}`);
+
+  // The facilitator rejects verify/settle whose description exceeds 500 characters.
+  const descs = [v2.resource?.description, ...(v2.accepts || []).map((a) => a.description)].filter(Boolean);
+  ok('bazaar: every description is within 500 chars',
+     descs.every((d) => d.length <= 500), `longest ${Math.max(0, ...descs.map((d) => d.length))}`);
+}
+
 console.log(fail ? `\n${fail} FAILED` : '\nall checks passed');
 process.exit(fail ? 1 : 0);

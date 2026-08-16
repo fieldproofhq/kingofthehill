@@ -168,7 +168,9 @@ function hillExtension(origin, priceUsd) {
           type: 'http',
           method: 'POST',
           bodyType: 'json',
-          bodyFields: { name: 'your-handle', url: 'https://example.com' },
+          // `body`, not `bodyFields`. The spec's schema sets additionalProperties:false on
+          // input, so an unrecognised key makes the whole declaration fail validation.
+          body: { name: 'your-handle', url: 'https://example.com' },
         },
         output: {
           type: 'json',
@@ -176,20 +178,42 @@ function hillExtension(origin, priceUsd) {
             took_the_crown: true,
             name: 'your-handle',
             paidUsd: priceUsd,
-            priceToTakeUsd: Math.round(priceUsd * 1.5 * 100) / 100,
+            priceToTakeUsd: Math.round(priceUsd * PRICE_RATIO * 100) / 100,
           },
         },
       },
+      // This schema validates `info`, NOT the request body. It previously described the
+      // {name, url} POST fields, which is a different object entirely — so it defined no
+      // `input` property, and the spec requires facilitators to validate `info` against it
+      // before cataloging. A declaration shaped like that is rejected, and the rejection is
+      // only visible in the EXTENSION-RESPONSES header on verify/settle.
       schema: {
+        $schema: 'https://json-schema.org/draft/2020-12/schema',
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'Display name shown on the board, max 32 chars' },
-          url: {
-            type: 'string',
-            description:
-              'Optional https link your territory points at, max 200 chars. Rendered nofollow. Paying again is the only way to change it.',
+          input: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', const: 'http' },
+              method: { type: 'string', enum: ['POST', 'PUT', 'PATCH'] },
+              bodyType: { type: 'string', enum: ['json', 'form-data', 'text'] },
+              body: { type: 'object' },
+              queryParams: { type: 'object', additionalProperties: { type: 'string' } },
+              headers: { type: 'object', additionalProperties: { type: 'string' } },
+            },
+            required: ['type', 'method', 'bodyType', 'body'],
+            additionalProperties: false,
+          },
+          output: {
+            type: 'object',
+            properties: {
+              type: { type: 'string' },
+              example: { type: 'object' },
+            },
+            required: ['type'],
           },
         },
+        required: ['input'],
       },
     },
   };
