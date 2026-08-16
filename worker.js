@@ -535,10 +535,20 @@ export default {
         {
           name: 'hill_take',
           description:
-            'Take the crown at the current price, paid in USDC on Base via x402. The price rises 1.5x for the next challenger. Returns payment instructions when unpaid.',
+            'Take the crown at the current price, paid in USDC on Base via x402. The price rises 1.5x for the next challenger, ' +
+            'and your territory is your share of everything ever paid — a ratio that SHRINKS every time anyone else pays. ' +
+            'Money paid is not returned: no payout, resale, dividend or claim on the pot, and later takes do not pay earlier ' +
+            'holders. You are buying a place on a board. Returns payment instructions when unpaid.',
           inputSchema: {
             type: 'object',
-            properties: { name: { type: 'string', description: 'Display name for the board, max 32 chars' } },
+            properties: {
+              name: { type: 'string', description: 'Display name for the board, max 32 chars' },
+              url: {
+                type: 'string',
+                description:
+                  'Optional https link your territory points at, max 200 chars, rendered nofollow. Paying again is the only way to change it.',
+              },
+            },
           },
         },
       ];
@@ -563,8 +573,11 @@ export default {
           if (rpc.params?.name === 'hill_status') return text(publicState(state));
           if (rpc.params?.name === 'hill_take') {
             const nm = cleanName(rpc.params?.arguments?.name);
+            // Forward the link. The schema advertises `url`, so dropping it here would make it
+            // a parameter that exists only in documentation.
+            const lnk = cleanUrl(rpc.params?.arguments?.url);
             if (c.free) {
-              const out = await crown(env, state, nm, state.priceUsd);
+              const out = await crown(env, state, nm, state.priceUsd, lnk);
               return text({ took_the_crown: true, name: nm, ...publicState(out) });
             }
             const priced = pricedCfg(c, state.priceUsd, 'Take the crown as ' + nm);
