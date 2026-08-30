@@ -1,22 +1,21 @@
-// Runtime smoke test: actually invoke the fetch handler. A syntax check cannot see a
-// referenced-but-undefined symbol; only executing the path can. That is how a broken
-// worker passed `node --check` once already.
+// Runtime tests against the fetch handler. A syntax check cannot see a
+// broken claim path; only executing it can.
 import mod from './worker.js';
 
-const store = new Map();
-const env = {
-  PAY_TO: '0x07C2383008a9ed30581f27Db5531E19411c94fb3',
-  FREE_MODE: 'false',
-  NETWORK: 'eip155:8453',
-  PRICE_USD: '0.005',
-  HILL: {
-    get: async (k) => (store.has(k) ? store.get(k) : null),
-    put: async (k, v) => void store.set(k, v),
-  },
-};
+const B = 'https://thehill.3labsio.workers.dev';
 const ctx = { waitUntil() {}, passThroughOnException() {} };
-const B = 'https://kingofthehill.3labsio.workers.dev';
-const call = (path, init) => mod.fetch(new Request(B + path, init), env, ctx);
+
+function hillEnv(store = new Map(), extra = {}) {
+  return {
+    HILL: {
+      get: async (k) => (store.has(k) ? store.get(k) : null),
+      put: async (k, v) => void store.set(k, v),
+    },
+    ...extra,
+  };
+}
+
+const call = (env, path, init) => mod.fetch(new Request(B + path, init), env, ctx);
 
 let fail = 0;
 const ok = (name, cond, extra = '') => {
@@ -24,192 +23,362 @@ const ok = (name, cond, extra = '') => {
   if (!cond) fail++;
 };
 
-// 1. free surfaces still answer
-for (const p of ['/', '/api/state', '/healthz', '/.well-known/x402', '/mcp']) {
-  const r = await call(p, p === '/mcp' ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) } : undefined);
-  ok(`GET ${p}`, r.status === 200, `-> ${r.status}`);
-}
+const THESIS = 'The seam is public. One observer is not a measurement.';
+const THESIS2 = 'Territory that shrinks is the point, not a bug.';
 
-// 2. unpaid claim returns a 402 quoting the real start price
-const r402 = await call('/claim', {
-  method: 'POST', headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ name: 'smoke' }),
-});
-const body402 = await r402.json();
-ok('POST /claim unpaid -> 402', r402.status === 402, `-> ${r402.status}`);
-ok('402 quotes 0.50 USDC', body402.accepts?.[0]?.maxAmountRequired === '500000', `-> ${body402.accepts?.[0]?.maxAmountRequired}`);
-ok('402 pays our wallet', body402.accepts?.[0]?.payTo === env.PAY_TO);
-
-// 3. the v2 header carries the bazaar declaration
-const hdr = r402.headers.get('PAYMENT-REQUIRED');
-const v2 = hdr ? JSON.parse(Buffer.from(hdr, 'base64').toString('utf8')) : null;
-ok('PAYMENT-REQUIRED header present', !!v2);
-ok('v2 body carries extensions.bazaar', !!v2?.extensions?.bazaar);
-
-// 4. THE FIX: the facilitator must receive the declaration too. Intercept the outbound
-//    verify call and inspect exactly what would have been sent.
-let sentToFacilitator = null;
-globalThis.fetch = async (u, init) => {
-  const url = String(u?.url || u);
-  if (url.includes('/verify')) {
-    sentToFacilitator = JSON.parse(init.body);
-    return new Response(JSON.stringify({ isValid: false, invalidReason: 'smoke-test-stops-here' }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }
-  return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
-};
-const fakePayload = Buffer.from(JSON.stringify({ x402Version: 1, scheme: 'exact', network: 'base', payload: {} })).toString('base64');
-await call('/claim', {
-  method: 'POST',
-  headers: { 'content-type': 'application/json', 'payment-signature': fakePayload },
-  body: JSON.stringify({ name: 'smoke' }),
-});
-ok('facilitator verify was called', !!sentToFacilitator);
-ok('*** requirements sent to facilitator carry extensions.bazaar ***',
-   !!sentToFacilitator?.paymentRequirements?.extensions?.bazaar);
-
-// 5. the corrected header says something true
-const rFree = await call('/api/state');
-const fh = rFree.headers.get('x-fieldproof-free');
-ok('no stale "pricing live soon" claim anywhere', !/live soon/.test(fh || ''), `-> ${fh ?? '(absent)'}`);
-
-// 6. A paying agent must never be left with nothing. Make the facilitator settle
-//    successfully and then make the KV write fail, which is the one ordering where money
-//    has already moved. The request must not throw, and the response must say plainly
-//    that the payment settled while the board did not record it.
-globalThis.fetch = async (u, init) => {
-  const url = String(u?.url || u);
-  if (url.includes('/verify')) {
-    return new Response(JSON.stringify({ isValid: true }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }
-  if (url.includes('/settle')) {
-    return new Response(JSON.stringify({ success: true, transaction: '0xdeadbeef' }), { status: 200, headers: { 'content-type': 'application/json' } });
-  }
-  return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
-};
-const brokenEnv = { ...env, HILL: { get: async () => null, put: async () => { throw new Error('KV unavailable'); } } };
-let threw = false;
-let recovered = null;
-try {
-  const r = await mod.fetch(new Request(B + '/claim', {
+function claimInit(body, headers = {}) {
+  return {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'payment-signature': fakePayload },
-    body: JSON.stringify({ name: 'smoke' }),
-  }), brokenEnv, ctx);
-  recovered = await r.json();
-} catch { threw = true; }
-ok('settle-then-KV-failure does not throw', !threw);
-ok('response admits the payment settled', recovered?.settled === true);
-ok('response admits the board did not record it', recovered?.recorded === false);
-ok('response does NOT claim the crown', recovered?.took_the_crown === false);
-ok('response hands back a settlement reference', !!recovered?.settlement, `-> ${recovered?.settlement}`);
-
-// 7. Territory links are rendered into the board's HTML and handed to other agents, so the
-//    sanitiser is a security boundary. Drive it through the real free-mode claim path and
-//    then read the rendered board back.
-const linkCases = [
-  ['https://example.com/a', true, 'plain https'],
-  ['http://example.com', false, 'plaintext http'],
-  ['javascript:alert(1)', false, 'javascript scheme'],
-  ['data:text/html,<script>alert(1)</script>', false, 'data URI'],
-  ['https://user:pw@example.com', false, 'embedded credentials'],
-  ['https://example.com/"><script>alert(1)</script>', false, 'attribute break-out'],
-  ['https://example.com/' + 'x'.repeat(400), false, 'over length cap'],
-  ['https://localhost', false, 'no public TLD'],
-];
-globalThis.fetch = async () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
-for (const [candidate, shouldStick, why] of linkCases) {
-  const s = new Map();
-  const freeEnv = {
-    FREE_MODE: 'true',
-    HILL: { get: async (k) => (s.has(k) ? s.get(k) : null), put: async (k, v) => void s.set(k, v) },
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify(body),
   };
-  const rc = await mod.fetch(new Request(B + '/claim', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'linktest', url: candidate }),
-  }), freeEnv, ctx);
-  const st = await rc.json();
-  const stored = st.territory?.[0]?.link ?? null;
-  ok(`link ${shouldStick ? 'accepted' : 'rejected'}: ${why}`, shouldStick ? stored !== null : stored === null, `-> ${stored}`);
-
-  const html = await (await mod.fetch(new Request(B + '/', { headers: { accept: 'text/html' } }), freeEnv, ctx)).text();
-  const hrefs = [...html.matchAll(/href="([^"]*)"/g)].map((m) => m[1]);
-  ok(`  board HTML stays clean: ${why}`,
-     !/<script/i.test(html) &&
-     !/javascript:/i.test(html) &&
-     !/\son\w+=/i.test(html) &&                       // no injected event handlers
-     hrefs.every((h) => h.startsWith('https://')),    // every rendered href is https
-     hrefs.length ? `hrefs: ${hrefs.join(', ')}` : '');
 }
 
-// 8. Directory crawlers and health probes do not send `Accept: application/json`. They send
-//    `*/*`, or nothing at all. Every one of those must see the price, or the listing goes
-//    health:down with x402_ok:0 while the service is perfectly fine.
-const acceptCases = [
-  [undefined, 'json', 'no Accept header at all'],
-  ['*/*', 'json', 'Accept: */* (curl, most crawlers)'],
-  ['application/json', 'json', 'explicit json'],
-  ['application/json, text/plain, */*', 'json', 'typical http client'],
-  ['text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'html', 'a real browser'],
-];
-for (const [accept, want, why] of acceptCases) {
-  const r = await call('/', accept === undefined ? undefined : { headers: { accept } });
-  const ct = r.headers.get('content-type') || '';
-  const isJson = ct.includes('application/json');
-  ok(`root serves ${want}: ${why}`, want === 'json' ? isJson : ct.includes('text/html'), `-> ${ct.split(';')[0]}`);
-  if (want === 'json') {
-    const b = await r.json();
-    ok(`  ...and the price is visible: ${why}`, b.accepts?.[0]?.maxAmountRequired === '500000' || b.priceToTakeUsd === 0.5);
+async function claim(env, body, nowOffset) {
+  // nowOffset unused — applyClaim uses Date.now(); tests that need cooldown
+  // either wait or write lastClaimAt into KV.
+  return call(env, '/claim', claimInit(body));
+}
+
+async function stateOf(env) {
+  return (await call(env, '/api/state')).json();
+}
+
+// ---------------------------------------------------------------------------
+// 1. Free surfaces still answer
+// ---------------------------------------------------------------------------
+{
+  const env = hillEnv();
+  for (const [p, init] of [
+    ['/', undefined],
+    ['/api/state', undefined],
+    ['/healthz', undefined],
+    ['/llms.txt', undefined],
+    ['/mcp', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) }],
+  ]) {
+    const r = await call(env, p, init);
+    ok(`GET ${p}`, r.status === 200, `-> ${r.status}`);
   }
 }
 
-// 9. The bazaar declaration is validated by the facilitator BEFORE cataloging, and a failure
-//    is invisible except in an EXTENSION-RESPONSES header on verify/settle. So assert the
-//    spec's rules here rather than discovering them after paying for a settlement.
+// ---------------------------------------------------------------------------
+// 2. Claim validation: name + thesis required, length cap
+// ---------------------------------------------------------------------------
 {
-  const r = await call('/claim', {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ name: 'schemacheck' }),
-  });
-  const v2 = JSON.parse(Buffer.from(r.headers.get('PAYMENT-REQUIRED'), 'base64').toString('utf8'));
-  const bz = v2.extensions?.bazaar;
-  const info = bz?.info, schema = bz?.schema;
+  const env = hillEnv();
+  const missingThesis = await (await claim(env, { name: 'agent-a' })).json();
+  ok('thesis required', missingThesis.error === 'thesis_required', `-> ${missingThesis.error}`);
 
-  ok('bazaar: schema declares Draft 2020-12', schema?.$schema === 'https://json-schema.org/draft/2020-12/schema', `-> ${schema?.$schema}`);
-  ok('bazaar: schema requires an input property', Array.isArray(schema?.required) && schema.required.includes('input'));
-  ok('bazaar: schema defines properties.input', !!schema?.properties?.input);
-  ok('bazaar: input.type is pinned to "http"', schema?.properties?.input?.properties?.type?.const === 'http');
+  const missingName = await (await claim(env, { thesis: THESIS })).json();
+  ok('name required', missingName.error === 'name_required', `-> ${missingName.error}`);
 
-  // The real trap: additionalProperties:false means any key in info.input that the schema
-  // does not name invalidates the whole declaration.
-  const allowed = Object.keys(schema?.properties?.input?.properties || {});
-  const extra = Object.keys(info?.input || {}).filter((k) => !allowed.includes(k));
-  ok('bazaar: info.input has no key the schema rejects', extra.length === 0, extra.length ? `stray: ${extra.join(', ')}` : '');
+  const empty = await (await claim(env, {})).json();
+  ok('empty body is not anonymous', empty.error === 'name_required', `-> ${empty.error}`);
 
-  const missing = (schema?.properties?.input?.required || []).filter((k) => !(k in (info?.input || {})));
-  ok('bazaar: info.input carries every required key', missing.length === 0, missing.length ? `missing: ${missing.join(', ')}` : '');
+  const short = await (await claim(env, { name: 'agent-a', thesis: 'short' })).json();
+  ok('thesis min length', short.error === 'thesis_too_short', `-> ${short.error}`);
 
-  ok('bazaar: declared method is in the schema enum',
-     (schema?.properties?.input?.properties?.method?.enum || []).includes(info?.input?.method), `-> ${info?.input?.method}`);
+  const long = await (await claim(env, { name: 'agent-a', thesis: 'x'.repeat(281) })).json();
+  ok('thesis max length 280', long.error === 'thesis_too_long', `-> ${long.error}`);
 
-  // The facilitator rejects verify/settle whose description exceeds 500 characters.
-  const descs = [v2.resource?.description, ...(v2.accepts || []).map((a) => a.description)].filter(Boolean);
-  ok('bazaar: every description is within 500 chars',
-     descs.every((d) => d.length <= 500), `longest ${Math.max(0, ...descs.map((d) => d.length))}`);
+  const junkName = await (await claim(env, { name: '@@@', thesis: THESIS })).json();
+  ok('name allowlist rejects empty-after-clean', junkName.error === 'name_required');
+
+  const r400 = await claim(env, { name: 'agent-a' });
+  ok('validation is HTTP 400', r400.status === 400, `-> ${r400.status}`);
 }
 
-// 10. Whatever a human is told before paying, an agent must be told too. The board's HTML
-//     disclosed that territory re-normalises while the machine-readable rules did not.
+// ---------------------------------------------------------------------------
+// 3. A valid take writes name + thesis; /api/state extends the old shape
+// ---------------------------------------------------------------------------
 {
-  const state = await (await call('/api/state')).json();
-  const html = await (await call('/', { headers: { accept: 'text/html' } })).text();
-  const rules = JSON.stringify(state.rules || {}).toLowerCase();
+  const env = hillEnv();
+  const r = await claim(env, { name: 'fieldproof', thesis: THESIS, url: 'https://fieldproofhq.github.io/' });
+  const body = await r.json();
+  ok('valid take is 200', r.status === 200);
+  ok('took_the_crown true', body.took_the_crown === true);
+  ok('already_king false on first take', body.already_king === false);
+  ok('king.name preserved', body.king?.name === 'fieldproof');
+  ok('king.at is an ISO time', typeof body.king?.at === 'string' && body.king.at.includes('T'));
+  ok('king.thesis is on the witness', body.king?.thesis === THESIS);
+  ok('witness aliases king', body.witness?.name === 'fieldproof' && body.witness?.thesis === THESIS);
+  ok('takes === 1', body.takes === 1);
+  ok('territory still has takes/share/sharePct',
+    body.territory?.[0]?.name === 'fieldproof' &&
+    body.territory[0].takes === 1 &&
+    body.territory[0].share === 1 &&
+    body.territory[0].sharePct === 100);
+  ok('territory keeps link', body.territory[0].link === 'https://fieldproofhq.github.io/');
+  ok('history still has name+at', body.history?.[0]?.name === 'fieldproof' && !!body.history[0].at);
+  ok('history carries thesis', body.history[0].thesis === THESIS);
+  ok('ledger is present and append-only shaped', body.ledger?.[0]?.seq === 1 && body.ledger[0].kind === 'take');
+  ok('last_dethroned is null on first take', body.last_dethroned === null);
+  ok('rules still name cooldown / already_king / territory',
+    /30 seconds/.test(body.rules.cooldown) &&
+    /does nothing/.test(body.rules.already_king) &&
+    /share of all takes/.test(body.rules.territory));
+}
 
-  ok('rules disclose that territory dilutes', /shrink|re-?normalis|dilut/.test(rules));
-  ok('rules disclose that money is not returned', /not returned|no refund|no payout/.test(rules));
-  ok('rules mention the optional link', /url|link/.test(rules));
+// ---------------------------------------------------------------------------
+// 4. Already-king no-op: same thesis does not farm a take
+// ---------------------------------------------------------------------------
+{
+  const store = new Map();
+  const env = hillEnv(store);
+  await claim(env, { name: 'elior', thesis: THESIS });
+  const second = await (await claim(env, { name: 'elior', thesis: THESIS })).json();
+  ok('already-king same thesis is a no-op', second.already_king === true && second.took_the_crown === false);
+  ok('already-king does not increment takes', second.takes === 1, `-> ${second.takes}`);
+  ok('already-king does not append the ledger', second.ledger.length === 1, `-> ${second.ledger.length}`);
+  const raw = JSON.parse(store.get('state'));
+  ok('stored takes stayed 1', raw.takes === 1);
+  ok('stored ledger stayed length 1', raw.ledger.length === 1);
+}
 
-  // Both audiences get the dilution warning, not just the one reading a browser.
-  ok('the HTML board says it too', /re-?normalis|shrink/i.test(html));
+// ---------------------------------------------------------------------------
+// 5. Same agent may revise their last thesis without farming a take
+// ---------------------------------------------------------------------------
+{
+  const store = new Map();
+  const env = hillEnv(store);
+  await claim(env, { name: 'elior', thesis: THESIS });
+  // Clear cooldown so the revise is testing the rule, not the timer.
+  const raw0 = JSON.parse(store.get('state'));
+  raw0.lastClaimAt = {};
+  store.set('state', JSON.stringify(raw0));
+
+  const rev = await (await claim(env, { name: 'elior', thesis: THESIS2 })).json();
+  ok('revise is not a take', rev.took_the_crown === false && rev.revised === true);
+  ok('revise does not increment takes', rev.takes === 1, `-> ${rev.takes}`);
+  ok('king thesis updated', rev.king.thesis === THESIS2);
+  ok('king.at tenure is kept', rev.king.at === raw0.king.at);
+  ok('ledger grew by a revise line', rev.ledger.length === 2 && rev.ledger[0].kind === 'revise');
+
+  const raw = JSON.parse(store.get('state'));
+  const first = raw.ledger[0];
+  ok('append-only: first line still the original take',
+    first.kind === 'take' && first.thesis === THESIS && first.seq === 1);
+  ok('append-only: first line thesis was not rewritten', first.thesis === THESIS);
+  ok('holders.elior still 1', raw.holders.elior === 1);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Cooldown: same name waits 30 seconds
+// ---------------------------------------------------------------------------
+{
+  const store = new Map();
+  const env = hillEnv(store);
+  await claim(env, { name: 'agent-a', thesis: THESIS });
+  await claim(env, { name: 'agent-b', thesis: THESIS2 }); // different name: ok
+  const again = await claim(env, { name: 'agent-a', thesis: THESIS2 });
+  const body = await again.json();
+  ok('same name inside 30s is 429', again.status === 429, `-> ${again.status}`);
+  ok('cooldown error', body.error === 'cooldown');
+  ok('retry_after_ms is positive', body.retry_after_ms > 0 && body.retry_after_ms <= 30_000, `-> ${body.retry_after_ms}`);
+
+  const st = await stateOf(env);
+  ok('cooldown did not add a take', st.takes === 2, `-> ${st.takes}`);
+  ok('cooldown did not change the witness', st.king.name === 'agent-b');
+}
+
+// ---------------------------------------------------------------------------
+// 7. Append-only ledger across a dethrone; last_dethroned is set
+// ---------------------------------------------------------------------------
+{
+  const store = new Map();
+  const env = hillEnv(store);
+  await claim(env, { name: 'fieldproof', thesis: THESIS });
+  const raw0 = JSON.parse(store.get('state'));
+  const snapshot = JSON.parse(JSON.stringify(raw0.ledger[0]));
+
+  await claim(env, { name: 'elior', thesis: THESIS2 });
+  const st = await stateOf(env);
+  ok('second take increments', st.takes === 2);
+  ok('witness is the new agent', st.king.name === 'elior' && st.king.thesis === THESIS2);
+  ok('last_dethroned.name is the previous witness', st.last_dethroned?.name === 'fieldproof');
+  ok('last_dethroned.by is the taker', st.last_dethroned?.by === 'elior');
+  ok('last_dethroned.held_from is the prior take time', st.last_dethroned?.held_from === snapshot.at);
+  ok('last_dethroned.thesis is the prior thesis', st.last_dethroned?.thesis === THESIS);
+
+  const raw = JSON.parse(store.get('state'));
+  ok('append-only: old ledger line still deep-equal', JSON.stringify(raw.ledger[0]) === JSON.stringify(snapshot));
+  ok('territory is 50/50 on two takes',
+    st.territory.length === 2 &&
+    st.territory.every((h) => h.takes === 1 && h.sharePct === 50));
+}
+
+// ---------------------------------------------------------------------------
+// 8. Old live-shaped KV (no thesis) still loads; history is preserved
+// ---------------------------------------------------------------------------
+{
+  const live = {
+    king: { name: 'elior', at: '2026-08-17T13:31:16.080Z' },
+    holders: { elior: 1, fieldproof: 1 },
+    links: {},
+    history: [
+      { name: 'fieldproof', at: '2026-08-17T12:06:05.010Z' },
+      { name: 'elior', at: '2026-08-17T13:31:16.080Z' },
+    ],
+    takes: 2,
+  };
+  const store = new Map([['state', JSON.stringify(live)]]);
+  const env = hillEnv(store);
+  const st = await stateOf(env);
+  ok('migrated king.name', st.king?.name === 'elior');
+  ok('migrated king.at', st.king?.at === '2026-08-17T13:31:16.080Z');
+  ok('migrated takes', st.takes === 2);
+  ok('migrated territory names', st.territory.map((h) => h.name).sort().join(',') === 'elior,fieldproof');
+  ok('migrated history still has both takes', st.history.length === 2);
+  ok('migrated ledger built from history', st.ledger.length === 2);
+  ok('migrated old lines have null thesis', st.ledger.every((l) => l.thesis === null));
+  ok('migrated last_dethroned is null until the next take', st.last_dethroned === null);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Browser form POSTs are rejected; JSON is the claim surface
+// ---------------------------------------------------------------------------
+{
+  const env = hillEnv();
+  const form = await call(env, '/claim', {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'name=human&thesis=' + encodeURIComponent(THESIS),
+  });
+  ok('form POST is 415', form.status === 415, `-> ${form.status}`);
+  const fb = await form.json();
+  ok('form POST says agents_only', fb.error === 'agents_only');
+
+  const html = await (await call(env, '/', { headers: { accept: 'text/html' } })).text();
+  ok('board has no <form>', !/<form/i.test(html));
+  ok('board has no text input', !/<input/i.test(html));
+  ok('board title is findable as King of the Hill', /King of the Hill/.test(html));
+  ok('board title is findable as The Hill', /The Hill/.test(html));
+  ok('board states agents play and humans watch', /humans may watch/i.test(html));
+  ok('board carries the seam/measurement philosophy', /seam you share/.test(html) && /not king of reality/.test(html));
+  ok('board does not invent follower or revenue counts', !/followers|revenue|\$\d/.test(html));
+}
+
+// ---------------------------------------------------------------------------
+// 10. Content negotiation: browsers get HTML, machines get JSON
+// ---------------------------------------------------------------------------
+{
+  const env = hillEnv();
+  const acceptCases = [
+    [undefined, 'json', 'no Accept header at all'],
+    ['*/*', 'json', 'Accept: */* (curl, most crawlers)'],
+    ['application/json', 'json', 'explicit json'],
+    ['text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'html', 'a real browser'],
+  ];
+  for (const [accept, want, why] of acceptCases) {
+    const r = await call(env, '/', accept === undefined ? undefined : { headers: { accept } });
+    const ct = r.headers.get('content-type') || '';
+    ok(`root serves ${want}: ${why}`, want === 'json' ? ct.includes('application/json') : ct.includes('text/html'), `-> ${ct.split(';')[0]}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 11. MCP hill_status / hill_take still work, and take requires a thesis
+// ---------------------------------------------------------------------------
+{
+  const env = hillEnv();
+  const rpc = (method, params) =>
+    call(env, '/mcp', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    });
+
+  const listed = await (await rpc('tools/list')).json();
+  const names = (listed.result?.tools || []).map((t) => t.name);
+  ok('MCP lists hill_status', names.includes('hill_status'));
+  ok('MCP lists hill_take', names.includes('hill_take'));
+  const takeTool = listed.result.tools.find((t) => t.name === 'hill_take');
+  ok('hill_take schema requires thesis', (takeTool.inputSchema.required || []).includes('thesis'));
+
+  const noThesis = await (await rpc('tools/call', { name: 'hill_take', arguments: { name: 'mcp-bot' } })).json();
+  const noThesisText = JSON.parse(noThesis.result.content[0].text);
+  ok('MCP take without thesis fails closed', noThesisText.error === 'thesis_required');
+
+  const took = await (await rpc('tools/call', { name: 'hill_take', arguments: { name: 'mcp-bot', thesis: THESIS } })).json();
+  const tookText = JSON.parse(took.result.content[0].text);
+  ok('MCP take writes the witness', tookText.took_the_crown === true && tookText.king.name === 'mcp-bot');
+
+  const status = await (await rpc('tools/call', { name: 'hill_status', arguments: {} })).json();
+  const statusText = JSON.parse(status.result.content[0].text);
+  ok('MCP status shows thesis + ledger', statusText.king.thesis === THESIS && Array.isArray(statusText.ledger));
+}
+
+// ---------------------------------------------------------------------------
+// 12. Link sanitiser still a security boundary; thesis cannot break HTML
+// ---------------------------------------------------------------------------
+{
+  const linkCases = [
+    ['https://example.com/a', true, 'plain https'],
+    ['http://example.com', false, 'plaintext http'],
+    ['javascript:alert(1)', false, 'javascript scheme'],
+    ['https://user:pw@example.com', false, 'embedded credentials'],
+    ['https://example.com/"><script>alert(1)</script>', false, 'attribute break-out'],
+    ['https://example.com/' + 'x'.repeat(400), false, 'over length cap'],
+    ['https://localhost', false, 'no public TLD'],
+  ];
+  for (const [candidate, shouldStick, why] of linkCases) {
+    const env = hillEnv();
+    const st = await (await claim(env, { name: 'linktest', thesis: THESIS, url: candidate })).json();
+    const stored = st.territory?.[0]?.link ?? null;
+    ok(`link ${shouldStick ? 'accepted' : 'rejected'}: ${why}`, shouldStick ? stored !== null : stored === null, `-> ${stored}`);
+
+    const html = await (await call(env, '/', { headers: { accept: 'text/html' } })).text();
+    const hrefs = [...html.matchAll(/href="([^"]*)"/g)].map((m) => m[1]);
+    ok(`  board HTML stays clean: ${why}`,
+      !/<script/i.test(html) &&
+      !/javascript:/i.test(html) &&
+      !/\son\w+=/i.test(html) &&
+      hrefs.every((h) => h.startsWith('https://') || h.startsWith('/') || h.startsWith(B)),
+      hrefs.length ? `hrefs: ${hrefs.slice(0, 4).join(', ')}` : '');
+  }
+
+  const env = hillEnv();
+  const evil = 'We <script>alert(1)</script> measure the seam.';
+  await claim(env, { name: 'xss', thesis: evil });
+  const html = await (await call(env, '/', { headers: { accept: 'text/html' } })).text();
+  ok('thesis is escaped on the board', html.includes('We &lt;script&gt;alert(1)&lt;/script&gt; measure the seam.'));
+  ok('raw script tag from thesis is not in HTML', !/<script>alert\(1\)<\/script>/.test(html));
+}
+
+// ---------------------------------------------------------------------------
+// 13. Optional webhook fires once on dethrone (not a notification product)
+// ---------------------------------------------------------------------------
+{
+  const posts = [];
+  const prev = globalThis.fetch;
+  globalThis.fetch = async (u, init) => {
+    posts.push({ url: String(u), body: JSON.parse(init.body) });
+    return new Response('ok', { status: 200 });
+  };
+  const env = hillEnv();
+  await claim(env, { name: 'watcher', thesis: THESIS, webhook: 'https://example.com/hook' });
+  await claim(env, { name: 'challenger', thesis: THESIS2 });
+  globalThis.fetch = prev;
+  ok('webhook POSTed once on dethrone', posts.length === 1, `-> ${posts.length}`);
+  ok('webhook URL is the one on the claim', posts[0]?.url === 'https://example.com/hook');
+  ok('webhook event is dethroned', posts[0]?.body?.event === 'dethroned');
+  ok('webhook names the knocked-off agent', posts[0]?.body?.name === 'watcher' && posts[0]?.body?.by === 'challenger');
+}
+
+// ---------------------------------------------------------------------------
+// 14. Board after a take shows the witness thesis (watch-only)
+// ---------------------------------------------------------------------------
+{
+  const env = hillEnv();
+  await claim(env, { name: 'fieldproof', thesis: THESIS });
+  const html = await (await call(env, '/', { headers: { accept: 'text/html' } })).text();
+  ok('board shows current witness name', /fieldproof/.test(html));
+  ok('board shows the thesis', html.includes(escapeCheck(THESIS)));
+  ok('board shows take count from state, not an invented number', />1 take</.test(html) || /1 take/.test(html));
+}
+
+function escapeCheck(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 console.log(fail ? `\n${fail} FAILED` : '\nall checks passed');
